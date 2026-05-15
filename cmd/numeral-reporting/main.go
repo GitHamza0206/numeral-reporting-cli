@@ -49,6 +49,7 @@ Usage:
   numeral-reporting activate <N> [--project DIR]
   numeral-reporting refresh [--project DIR]
   numeral-reporting export <N> <out.pdf> [--url URL] [--project DIR]
+  numeral-reporting entities list|show|reset [...] [--project DIR]
 
 Run inside a project directory, or pass --project DIR.
 `
@@ -58,7 +59,14 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
-	cmd, args := os.Args[1], reorderFlags(os.Args[2:])
+	cmd := os.Args[1]
+	rawArgs := os.Args[2:]
+	// Subcommand-style entry points keep raw args so the *sub*-subcommand
+	// (e.g. `entities list`) stays the first positional.
+	args := rawArgs
+	if cmd != "entities" {
+		args = reorderFlags(rawArgs)
+	}
 	var err error
 	switch cmd {
 	case "init":
@@ -85,6 +93,8 @@ func main() {
 		err = cmdRefresh(args)
 	case "export":
 		err = cmdExport(args)
+	case "entities":
+		err = cmdEntities(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
