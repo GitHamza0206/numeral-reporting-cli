@@ -8,6 +8,10 @@ When an agent needs to generate, edit, validate, or review a Numeral report, loa
 skills/numeral-reporting-agent/SKILL.md
 ```
 
+That file is the index. It points to the five sub-skills that cover the full
+pipeline (consolidate → categorize → business rules → safe inference →
+income statement). Load whichever sub-skill matches the current step.
+
 ## Fast path
 
 From the repository root:

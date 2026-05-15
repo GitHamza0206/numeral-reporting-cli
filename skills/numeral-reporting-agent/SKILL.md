@@ -7,6 +7,30 @@ description: Use when generating, editing, validating, or reviewing Numeral stat
 
 Use this skill to create high-quality Numeral reports without guessing, leaking internal tooling, or shipping inconsistent numbers.
 
+## Sub-skills (load when relevant)
+
+These five files extend this skill. Each is self-contained — load whichever matches the current step:
+
+| Sub-skill | Use when |
+| --- | --- |
+| [`consolidate.md`](./consolidate.md) | Merging historical periods + current-period data into one `report.json`; deciding whether to clone a frozen version; handling re-imports; marking provisional state. |
+| [`categorize.md`](./categorize.md) | Assigning a PCG account and a CR bucket to a raw FEC line, bank libellé, or Pennylane export entry. |
+| [`business-rules.md`](./business-rules.md) | Computing TVA, charges sociales, amortissement, cut-off (FNP/CCA/FAE/PCA), provisions, and IS. |
+| [`safe-inference.md`](./safe-inference.md) | Deciding whether a missing element can be inferred deterministically, or must be left as an alert. |
+| [`income-statement.md`](./income-statement.md) | Assembling a coherent CR/SIG and driving `doctor --strict` to green. |
+
+## End-to-end pipeline
+
+When the user gives raw data and asks for a report:
+
+1. **Consolidate** historical + new data → `consolidate.md`
+2. **Categorize** each flow into a PCG account → `categorize.md`
+3. **Apply business rules** (TVA, charges, amortissement, cut-off, IS) → `business-rules.md`
+4. **Fill gaps only if safely inferable**, otherwise raise alerts → `safe-inference.md`
+5. **Assemble the CR**, pass `doctor --strict`, render → `income-statement.md`
+
+Never skip a step. Never write a number you can't trace back to a source or a documented inference.
+
 ## Default Workflow
 
 1. Start from the CLI factory whenever possible.

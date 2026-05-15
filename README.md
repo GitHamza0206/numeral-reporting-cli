@@ -97,16 +97,29 @@ versions, and changes the active version.
 
 ## Agent bundle
 
-This CLI includes an exportable agent guide:
+This CLI ships with the skills Claude Code needs to actually drive it.
+The intelligence lives in the markdown — the binary stays a thin set of
+primitives.
 
-- `AGENTS.md` tells coding agents when to use the bundled skill.
-- `skills/numeral-reporting-agent/SKILL.md` explains the report creation,
-  evidence, validation, and delivery workflow.
-- `skills/numeral-reporting-agent/agents/openai.yaml` provides OpenAI skill
+- `AGENTS.md` — entry point for coding agents.
+- `skills/numeral-reporting-agent/SKILL.md` — main skill, indexes the
+  five sub-skills below and lays out the 5-step pipeline.
+- `skills/numeral-reporting-agent/consolidate.md` — merge historical
+  versions and the current-period data into one `report.json`, handle
+  re-imports without duplicates, mark provisional periods.
+- `skills/numeral-reporting-agent/categorize.md` — PCG account mapping
+  and libellé heuristics for FEC, CSV bancaire, Pennylane exports.
+- `skills/numeral-reporting-agent/business-rules.md` — TVA, charges
+  sociales, amortissement, cut-off (FNP/CCA/FAE/PCA), provisions, IS.
+- `skills/numeral-reporting-agent/safe-inference.md` — what can be
+  inferred deterministically and what must stay as an alert.
+- `skills/numeral-reporting-agent/income-statement.md` — assemble a
+  coherent CR/SIG and drive `doctor --strict` to green.
+- `skills/numeral-reporting-agent/agents/openai.yaml` — OpenAI skill
   metadata.
 
 When sharing the CLI with an agent, export the whole `numeral-reporting-cli/`
-directory so the binary, docs, and skill stay together.
+directory so the binary, docs, and skills stay together.
 
 ## PDF export
 
