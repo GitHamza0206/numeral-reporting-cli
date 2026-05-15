@@ -1,0 +1,15 @@
+# Build artifacts
+/numeral-reporting
+/dist/
+/exports/
+
+# Go build cache
+/.gocache/
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

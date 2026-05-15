@@ -1,0 +1,4 @@
+interface:
+  display_name: "Numeral Reporting Agent"
+  short_description: "Generate and validate Numeral reports"
+  default_prompt: "Use $numeral-reporting-agent to create, validate, and deliver a high-quality Numeral report safely."
