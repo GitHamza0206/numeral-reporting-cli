@@ -62,7 +62,7 @@ func saveEntities(root string, store *entities.Store) error {
 // reordered so flag.Parse handles them regardless of caller ordering.
 func cmdEntities(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("entities: subcommand required (list|show|reset)")
+		return fmt.Errorf("entities: subcommand required (list|show|merge|split|rename|reset)")
 	}
 	sub, rest := args[0], reorderFlags(args[1:])
 	switch sub {
@@ -70,22 +70,31 @@ func cmdEntities(args []string) error {
 		return entitiesList(rest)
 	case "show":
 		return entitiesShow(rest)
+	case "merge":
+		return entitiesMerge(rest)
+	case "split":
+		return entitiesSplit(rest)
+	case "rename":
+		return entitiesRename(rest)
 	case "reset":
 		return entitiesReset(rest)
 	case "-h", "--help", "help":
 		fmt.Print(entitiesUsage)
 		return nil
 	default:
-		return fmt.Errorf("entities: unknown subcommand %q (want list|show|reset)", sub)
+		return fmt.Errorf("entities: unknown subcommand %q (want list|show|merge|split|rename|reset)", sub)
 	}
 }
 
 const entitiesUsage = `numeral-reporting entities — manage the project entity table
 
 Usage:
-  numeral-reporting entities list  [--project DIR] [--kind KIND] [--json]
-  numeral-reporting entities show  <id> [--project DIR]
-  numeral-reporting entities reset [--project DIR] [--yes]
+  numeral-reporting entities list   [--project DIR] [--kind KIND] [--json]
+  numeral-reporting entities show   <id> [--project DIR]
+  numeral-reporting entities merge  <src_id> <dst_id> [--project DIR]
+  numeral-reporting entities split  <id> <new_name> --keys k1,k2,... [--project DIR]
+  numeral-reporting entities rename <id> <new_name> [--project DIR]
+  numeral-reporting entities reset  [--project DIR] [--yes]
 
 entities.json sits at the project root, shared across versions.
 `
@@ -205,6 +214,222 @@ func truncate(s string, max int) string {
 	}
 	r := []rune(s)
 	return string(r[:max-1]) + "…"
+}
+
+// ---- entities merge / split / rename ----
+
+func entitiesMerge(args []string) error {
+	fs := flag.NewFlagSet("entities merge", flag.ExitOnError)
+	project := fs.String("project", ".", "project directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return fmt.Errorf("entities merge: expected <src_id> <dst_id>, got %d args", len(rest))
+	}
+	srcID, dstID := rest[0], rest[1]
+	if srcID == dstID {
+		return fmt.Errorf("entities merge: src and dst must differ")
+	}
+	root, err := filepath.Abs(*project)
+	if err != nil {
+		return err
+	}
+	store, err := loadEntities(root)
+	if err != nil {
+		return err
+	}
+	src := store.FindByID(srcID)
+	dst := store.FindByID(dstID)
+	if src == nil {
+		return fmt.Errorf("entities merge: source entity %q not found", srcID)
+	}
+	if dst == nil {
+		return fmt.Errorf("entities merge: destination entity %q not found", dstID)
+	}
+
+	// Union keys/IBANs/aliases on dst, drop src.
+	dst.NormalizedKeys = append(dst.NormalizedKeys, src.NormalizedKeys...)
+	dst.IBANs = append(dst.IBANs, src.IBANs...)
+	dst.Aliases = append(dst.Aliases, src.Aliases...)
+	if dst.SIRET == "" {
+		dst.SIRET = src.SIRET
+	}
+	dst.ManualOverrides = append(dst.ManualOverrides, entities.Override{
+		Kind:   entities.OverrideMergeInto,
+		Source: src.ID,
+		Target: dst.ID,
+		Note:   "merged from " + src.CanonicalName,
+		Date:   time.Now().UTC().Format(time.RFC3339),
+	})
+
+	// Remove src.
+	out := store.Entities[:0]
+	for _, e := range store.Entities {
+		if e.ID == src.ID {
+			continue
+		}
+		out = append(out, e)
+	}
+	store.Entities = out
+
+	if err := saveEntities(root, store); err != nil {
+		return err
+	}
+	fmt.Printf("merged %s → %s (%d keys, %d ibans)\n",
+		srcID, dstID, len(dst.NormalizedKeys), len(dst.IBANs))
+	return nil
+}
+
+func entitiesSplit(args []string) error {
+	fs := flag.NewFlagSet("entities split", flag.ExitOnError)
+	project := fs.String("project", ".", "project directory")
+	keys := fs.String("keys", "", "comma-separated normalized keys to move into the new entity (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return fmt.Errorf("entities split: expected <id> <new_canonical_name>, got %d args", len(rest))
+	}
+	id, newName := rest[0], rest[1]
+	if *keys == "" {
+		return fmt.Errorf("entities split: --keys is required")
+	}
+	splitKeys := splitCSV(*keys)
+	if len(splitKeys) == 0 {
+		return fmt.Errorf("entities split: --keys produced no entries")
+	}
+	root, err := filepath.Abs(*project)
+	if err != nil {
+		return err
+	}
+	store, err := loadEntities(root)
+	if err != nil {
+		return err
+	}
+	parent := store.FindByID(id)
+	if parent == nil {
+		return fmt.Errorf("entities split: entity %q not found", id)
+	}
+
+	// Validate every requested key belongs to the parent.
+	have := map[string]struct{}{}
+	for _, k := range parent.NormalizedKeys {
+		have[k] = struct{}{}
+	}
+	for _, k := range splitKeys {
+		if _, ok := have[k]; !ok {
+			return fmt.Errorf("entities split: key %q does not belong to %s", k, id)
+		}
+	}
+
+	// Build the new entity. ID derived from new canonical name (stable).
+	newID := entities.NewEntityID(newName)
+	if newID == id {
+		return fmt.Errorf("entities split: new canonical name yields the same ID as the source")
+	}
+	newKeysSet := map[string]struct{}{}
+	for _, k := range splitKeys {
+		newKeysSet[k] = struct{}{}
+	}
+	keepOnParent := parent.NormalizedKeys[:0]
+	for _, k := range parent.NormalizedKeys {
+		if _, ok := newKeysSet[k]; ok {
+			continue
+		}
+		keepOnParent = append(keepOnParent, k)
+	}
+	parent.NormalizedKeys = keepOnParent
+	parent.ManualOverrides = append(parent.ManualOverrides, entities.Override{
+		Kind:   entities.OverrideSplitFrom,
+		Source: parent.ID,
+		Target: newID,
+		Note:   "split keys: " + *keys,
+		Date:   time.Now().UTC().Format(time.RFC3339),
+	})
+
+	newEntity := entities.Entity{
+		ID:             newID,
+		CanonicalName:  newName,
+		Kind:           parent.Kind,
+		NormalizedKeys: splitKeys,
+		CreatedByRun:   "manual_split",
+		FirstSeen:      time.Now().UTC().Format(time.RFC3339),
+	}
+	store.Entities = append(store.Entities, newEntity)
+
+	if err := saveEntities(root, store); err != nil {
+		return err
+	}
+	fmt.Printf("split %s → new %s (%d keys moved)\n", id, newID, len(splitKeys))
+	return nil
+}
+
+func entitiesRename(args []string) error {
+	fs := flag.NewFlagSet("entities rename", flag.ExitOnError)
+	project := fs.String("project", ".", "project directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return fmt.Errorf("entities rename: expected <id> <new_canonical_name>, got %d args", len(rest))
+	}
+	id, newName := rest[0], rest[1]
+	root, err := filepath.Abs(*project)
+	if err != nil {
+		return err
+	}
+	store, err := loadEntities(root)
+	if err != nil {
+		return err
+	}
+	e := store.FindByID(id)
+	if e == nil {
+		return fmt.Errorf("entities rename: entity %q not found", id)
+	}
+	old := e.CanonicalName
+	e.CanonicalName = newName
+	if err := saveEntities(root, store); err != nil {
+		return err
+	}
+	fmt.Printf("renamed %s: %q → %q\n", id, old, newName)
+	return nil
+}
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := []string{}
+	current := []rune{}
+	for _, r := range s {
+		if r == ',' {
+			if t := trimRunes(current); len(t) > 0 {
+				parts = append(parts, string(t))
+			}
+			current = current[:0]
+			continue
+		}
+		current = append(current, r)
+	}
+	if t := trimRunes(current); len(t) > 0 {
+		parts = append(parts, string(t))
+	}
+	return parts
+}
+
+func trimRunes(in []rune) []rune {
+	start, end := 0, len(in)
+	for start < end && (in[start] == ' ' || in[start] == '\t') {
+		start++
+	}
+	for end > start && (in[end-1] == ' ' || in[end-1] == '\t') {
+		end--
+	}
+	return in[start:end]
 }
 
 // ---- score subcommand ----

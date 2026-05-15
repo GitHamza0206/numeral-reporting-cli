@@ -843,7 +843,7 @@ func cmdApp(args []string) error {
 	return http.ListenAndServe(*addr, mux)
 }
 
-func doctorStaticProject(root string, version string, strict bool, asJSON bool) error {
+func doctorStaticProject(root string, version string, strict bool, asJSON bool, scoreThreshold int) error {
 	n, err := staticVersionFromFlag(root, version)
 	if err != nil {
 		return err
@@ -858,6 +858,24 @@ func doctorStaticProject(root string, version string, strict bool, asJSON bool) 
 	}
 
 	errorsFound, warnings := staticDoctorFindings(report, evidence)
+
+	// Reliability score gate: when --score-threshold is set, a global below
+	// it counts as a warning (or an error in strict mode).
+	if scoreThreshold > 0 {
+		if report.Score.Global == 0 {
+			warnings = append(warnings,
+				"score not computed — run `numeral-reporting score --write` before doctor with --score-threshold")
+		} else if report.Score.Global < scoreThreshold {
+			msg := fmt.Sprintf("reliability score %d%% < threshold %d%%",
+				report.Score.Global, scoreThreshold)
+			if strict {
+				errorsFound = append(errorsFound, msg)
+			} else {
+				warnings = append(warnings, msg)
+			}
+		}
+	}
+
 	ok := len(errorsFound) == 0 && (!strict || len(warnings) == 0)
 	if asJSON {
 		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{

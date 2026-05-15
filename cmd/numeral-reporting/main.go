@@ -149,6 +149,7 @@ func cmdDoctor(args []string) error {
 	version := fs.String("version", "v0", "version to inspect (for example v0 or 0)")
 	strict := fs.Bool("strict", false, "treat warnings as blocking")
 	asJSON := fs.Bool("json", false, "output machine-readable JSON")
+	scoreThreshold := fs.Int("score-threshold", 0, "if >0, --strict blocks when report Score.Global is below this percent")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -158,7 +159,7 @@ func cmdDoctor(args []string) error {
 		return err
 	}
 	if isStaticProject(root) {
-		return doctorStaticProject(root, *version, *strict, *asJSON)
+		return doctorStaticProject(root, *version, *strict, *asJSON, *scoreThreshold)
 	}
 	script := filepath.Join(root, "scripts", "reporting-doctor.mjs")
 	if _, err := os.Stat(script); err != nil {
