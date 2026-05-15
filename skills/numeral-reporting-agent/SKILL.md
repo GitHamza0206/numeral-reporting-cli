@@ -9,7 +9,7 @@ Use this skill to create high-quality Numeral reports without guessing, leaking 
 
 ## Sub-skills (load when relevant)
 
-These five files extend this skill. Each is self-contained — load whichever matches the current step:
+These files extend this skill. Each is self-contained — load whichever matches the current step:
 
 | Sub-skill | Use when |
 | --- | --- |
@@ -18,6 +18,8 @@ These five files extend this skill. Each is self-contained — load whichever ma
 | [`business-rules.md`](./business-rules.md) | Computing TVA, charges sociales, amortissement, cut-off (FNP/CCA/FAE/PCA), provisions, and IS. |
 | [`safe-inference.md`](./safe-inference.md) | Deciding whether a missing element can be inferred deterministically, or must be left as an alert. |
 | [`income-statement.md`](./income-statement.md) | Assembling a coherent CR/SIG and driving `doctor --strict` to green. |
+| [`entity-resolution.md`](./entity-resolution.md) | Interacting with the `entities.json` store; interpreting Resolve match kinds; merging / splitting / renaming entities to keep the identity sub-score stable. |
+| [`scoring.md`](./scoring.md) | Reading the reliability score; deciding ship vs. revise; remediating low scores using the top-risks list. |
 
 ## End-to-end pipeline
 
@@ -28,8 +30,11 @@ When the user gives raw data and asks for a report:
 3. **Apply business rules** (TVA, charges, amortissement, cut-off, IS) → `business-rules.md`
 4. **Fill gaps only if safely inferable**, otherwise raise alerts → `safe-inference.md`
 5. **Assemble the CR**, pass `doctor --strict`, render → `income-statement.md`
+6. **Compute reliability score**, fix top risks until ≥ 85 % → `scoring.md` (uses `entity-resolution.md` and steps 1–5)
 
-Never skip a step. Never write a number you can't trace back to a source or a documented inference.
+The first five steps are skill-driven (markdown, Claude's judgment). Step 6 is deterministic — the CLI does the math via `numeral-reporting score`. Use the skill to interpret the result and decide what to remediate.
+
+Never skip a step. Never write a number you can't trace back to a source or a documented inference. Never ship without a reliability score ≥ 85 %.
 
 ## Default Workflow
 

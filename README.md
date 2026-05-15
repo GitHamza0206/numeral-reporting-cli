@@ -32,6 +32,8 @@ go build -o numeral-reporting ./cmd/numeral-reporting
 | `activate <N>` | Set `active_version` |
 | `refresh` | Legacy Next.js: rewrite `reports/registry.ts` from the directory contents |
 | `export <N> <out.pdf> [--url URL]` | Export a version to PDF via headless Chrome |
+| `score [--version vN] [--json] [--write] [--score-threshold N]` | Compute the deterministic reliability score (3 blocks weighted by €) and top risks |
+| `entities <list\|show\|merge\|split\|rename\|reset>` | Manage the project-wide entity store (`entities.json`) |
 
 All commands accept `--project DIR` to operate on a project other than
 the current directory.
@@ -115,6 +117,10 @@ primitives.
   inferred deterministically and what must stay as an alert.
 - `skills/numeral-reporting-agent/income-statement.md` — assemble a
   coherent CR/SIG and drive `doctor --strict` to green.
+- `skills/numeral-reporting-agent/entity-resolution.md` — interact with
+  the entity store; merge / split / rename when needed.
+- `skills/numeral-reporting-agent/scoring.md` — read the reliability
+  score and remediate top risks.
 - `skills/numeral-reporting-agent/agents/openai.yaml` — OpenAI skill
   metadata.
 
@@ -133,14 +139,77 @@ numeral-reporting export 1 my-report/exports/v1.pdf --project my-report
 
 For legacy Next.js projects, keep running the web app first and pass `--url`.
 
+## Reliability score
+
+The CLI ships a deterministic engine that scores how close the generated
+P&L is to economic reality. The score breaks the period into three
+mutually exclusive blocks weighted by €:
+
+- **traité** — transactions the engine classified, each with sub-scores
+  for identity (40 %), accounting coherence (30 %), recurrence (20 %)
+  and amount coherence (10 %).
+- **non_traité** — transactions left unclassified, weighted by a per-
+  category sensitivity coefficient (CA × 1.5, salaires × 1.3, loyer ×
+  1.2, achats × 1.0, divers × 0.8).
+- **ajusté** — engine-added entries (CCA / FNP / FAE / PCA / social /
+  amort), scored on historical pattern, current signal and PCG
+  coherence.
+
+```bash
+numeral-reporting score --project my-report --version v0
+numeral-reporting score --project my-report --version v0 --write
+numeral-reporting score --project my-report --version v0 --score-threshold 85
+```
+
+`--write` persists block scores, top risks, and a percent global into
+`report.json` (consumed by the renderer) and per-transaction sub-scores
+into `versions/vN/transactions.json`. Threshold buckets:
+
+| Global | Lecture |
+| --- | --- |
+| ≥ 90 % | Très fiable — publication immédiate |
+| 85–90 % | Envoyable au client (seuil par défaut) |
+| 80–85 % | Acceptable avec revue rapide |
+| 70–80 % | Fragile |
+| < 70 % | Non fiable |
+
+The engine is pure (no I/O, no time inside the math) and entirely
+deterministic: same inputs → same score, on any machine. Coefficients
+live in `internal/scoring/sensitivity.go` — changing them requires
+bumping the schema version.
+
+## Entity store
+
+Identity is 40 % of the per-transaction score, so the CLI ships a
+deterministic entity resolver. Bank libellés are normalized (NFD strip
+accents → ASCII lowercase → strip dates / refs / SEPA noise), then
+matched in priority: manual override > exact normalized > IBAN > SIRET
+> Damerau-Levenshtein fuzzy ≥ 0.85 (tie-break: smaller ID wins). The
+store sits in `entities.json` at the project root and is shared across
+versions.
+
+```bash
+numeral-reporting entities list   --project my-report
+numeral-reporting entities show   ent_xxxxxxxxxxxx --project my-report
+numeral-reporting entities merge  ent_src ent_dst --project my-report
+numeral-reporting entities split  ent_xxx "Vendor B" --keys "vendor b sas" --project my-report
+numeral-reporting entities rename ent_xxx "OVH Cloud" --project my-report
+```
+
 ## Layout
 
 ```
-cmd/numeral-reporting/main.go        flag parsing + subcommand dispatch
-cmd/numeral-reporting/factory.go     report factory profiles
-cmd/numeral-reporting/static.go      static project, doctor, render, app server
-cmd/numeral-reporting/report.css     embedded original report design system
+cmd/numeral-reporting/main.go         flag parsing + subcommand dispatch
+cmd/numeral-reporting/factory.go      report factory profiles
+cmd/numeral-reporting/static.go       static project, doctor, render, app server
+cmd/numeral-reporting/score.go        score + entities CLI glue
+cmd/numeral-reporting/report.css      embedded original report design system
 cmd/numeral-reporting/numeral_shell.css embedded original version navbar styles
-internal/reports/reports.go          legacy Next.js version operations
-internal/pdf/pdf.go                  headless-Chrome PDF wrapper
+internal/entities/normalize.go        deterministic libellé normalization
+internal/entities/entities.go         Entity / Store / Override persistence
+internal/entities/resolve.go          Resolve pipeline + Cluster + Damerau-Levenshtein
+internal/scoring/sensitivity.go       coefficients, PCG table, materiality
+internal/scoring/scoring.go           3-block reliability engine + top risks
+internal/reports/reports.go           legacy Next.js version operations
+internal/pdf/pdf.go                   headless-Chrome PDF wrapper
 ```
