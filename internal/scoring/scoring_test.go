@@ -268,3 +268,199 @@ func TestComputeTreatedAmountCoherence(t *testing.T) {
 func approx(a, b, epsilon float64) bool {
 	return math.Abs(a-b) <= epsilon
 }
+
+func sameRisk(a, b Risk) bool {
+	if a.Kind != b.Kind || a.Label != b.Label || a.EntityID != b.EntityID {
+		return false
+	}
+	if a.Amount != b.Amount || a.ImpactPct != b.ImpactPct {
+		return false
+	}
+	if len(a.TxIDs) != len(b.TxIDs) {
+		return false
+	}
+	for i := range a.TxIDs {
+		if a.TxIDs[i] != b.TxIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestComputeUntreatedSensitivity(t *testing.T) {
+	// totalPnL = 10 000 ; one non_traité tx with 1000 CA (×1.5 = 1500),
+	// one with 500 divers (×0.8 = 400). Weighted = 1900.
+	// Score = 1 - 1900/10000 = 0.81. Amount = 1500 unweighted.
+	txs := []Transaction{
+		{ID: "a", Amount: 1000, Status: StatusNonTraite, Category: "ca"},
+		{ID: "b", Amount: -500, Status: StatusNonTraite, Category: "divers"},
+	}
+	block, _ := ComputeUntreated(txs, 10_000)
+	if block.Amount != 1500 {
+		t.Errorf("block.Amount = %v want 1500", block.Amount)
+	}
+	if !approx(block.Score, 0.81, 1e-9) {
+		t.Errorf("block.Score = %v want 0.81", block.Score)
+	}
+}
+
+func TestComputeUntreatedZeroPnL(t *testing.T) {
+	block, _ := ComputeUntreated(nil, 0)
+	if block.Score != 0 || block.Amount != 0 {
+		t.Errorf("zero input must yield zero block, got %+v", block)
+	}
+}
+
+func TestComputeAdjustedHappyPath(t *testing.T) {
+	// Adjustment with pattern_historique 1.0 (entity in 1 of 1 prior version),
+	// signal_actuel 0.9, coherence_metier 1.0 (FNP on 408x).
+	// score_aj = 0.45*1 + 0.35*0.9 + 0.20*1 = 0.45 + 0.315 + 0.20 = 0.965
+	history := []HistoricalSnapshot{
+		{Version: "v1", EntityMonths: map[string]map[string]int{"ent_x": {"2024-01": 1}}},
+	}
+	sa := 0.9
+	txs := []Transaction{{
+		ID: "aj1", Amount: -2000, Status: StatusAjustement,
+		EntityID: "ent_x", Account: "408100",
+		Adjustment: &Adjustment{Reason: "fnp", SignalActuel: &sa},
+	}}
+	block, comp := ComputeAdjusted(txs, history)
+	if block.Amount != 2000 {
+		t.Errorf("Amount = %v want 2000", block.Amount)
+	}
+	if !approx(comp["aj1"].ScoreAj, 0.965, 1e-9) {
+		t.Errorf("score_aj = %v want 0.965", comp["aj1"].ScoreAj)
+	}
+}
+
+func TestComputeAdjustedDefaultSignal(t *testing.T) {
+	// No signal_actuel from agent → default 0.5. Pattern hist = 0 (no history).
+	// Coherence_metier with no reason → 0.5.
+	// score_aj = 0.45*0 + 0.35*0.5 + 0.20*0.5 = 0 + 0.175 + 0.10 = 0.275
+	txs := []Transaction{{
+		ID:         "aj1",
+		Amount:     -1000,
+		Status:     StatusAjustement,
+		Adjustment: &Adjustment{},
+	}}
+	_, comp := ComputeAdjusted(txs, nil)
+	if !approx(comp["aj1"].ScoreAj, 0.275, 1e-9) {
+		t.Errorf("score_aj = %v want 0.275", comp["aj1"].ScoreAj)
+	}
+}
+
+func TestComputeGlobal(t *testing.T) {
+	// Scenario: 80% traité bien classé, 15% non traité divers, 5% ajustement.
+	// totalPnL = 10 000.
+	txs := []Transaction{
+		// 8 traité × 1000 ; identité 1.0, cohérence 1.0
+		{ID: "t01", Amount: 1000, Status: StatusTraite, Account: "706", Category: "ca", MatchConfidence: 1.0},
+		{ID: "t02", Amount: 1000, Status: StatusTraite, Account: "706", Category: "ca", MatchConfidence: 1.0},
+		{ID: "t03", Amount: 1000, Status: StatusTraite, Account: "706", Category: "ca", MatchConfidence: 1.0},
+		{ID: "t04", Amount: 1000, Status: StatusTraite, Account: "706", Category: "ca", MatchConfidence: 1.0},
+		{ID: "t05", Amount: -1000, Status: StatusTraite, Account: "606", Category: "achats", MatchConfidence: 1.0},
+		{ID: "t06", Amount: -1000, Status: StatusTraite, Account: "606", Category: "achats", MatchConfidence: 1.0},
+		{ID: "t07", Amount: -1000, Status: StatusTraite, Account: "606", Category: "achats", MatchConfidence: 1.0},
+		{ID: "t08", Amount: -1000, Status: StatusTraite, Account: "606", Category: "achats", MatchConfidence: 1.0},
+		// 1500 non traité divers (×0.8)
+		{ID: "u01", Amount: -1500, Status: StatusNonTraite, Category: "divers"},
+		// 500 ajustement (default neutral)
+		{ID: "a01", Amount: -500, Status: StatusAjustement, Adjustment: &Adjustment{}},
+	}
+	r, _ := Compute(txs, nil, Config{SkipRecurrence: true, SkipAmountCoherence: true})
+	if r.TotalPnL != 10_000 {
+		t.Errorf("TotalPnL = %v want 10000", r.TotalPnL)
+	}
+	// traité Amount = 8000
+	if r.Treated.Amount != 8000 {
+		t.Errorf("Treated.Amount = %v want 8000", r.Treated.Amount)
+	}
+	// Untreated Amount = 1500, Score = 1 - (1500*0.8)/10000 = 1 - 0.12 = 0.88
+	if r.Untreated.Amount != 1500 || !approx(r.Untreated.Score, 0.88, 1e-9) {
+		t.Errorf("Untreated bloc = %+v", r.Untreated)
+	}
+	// All three blocks fold into the weighted global.
+	denom := r.Treated.Amount + r.Untreated.Amount + r.Adjusted.Amount
+	expectedGlobal := (r.Treated.Amount*r.Treated.Score +
+		r.Untreated.Amount*r.Untreated.Score +
+		r.Adjusted.Amount*r.Adjusted.Score) / denom
+	if !approx(r.Global, expectedGlobal, 1e-9) {
+		t.Errorf("Global = %v want %v", r.Global, expectedGlobal)
+	}
+	if r.Materiality != 100 {
+		t.Errorf("Materiality = %v want 100", r.Materiality)
+	}
+}
+
+func TestComputeTopRisksOrderedByImpact(t *testing.T) {
+	// Two non-traité on distinct entities: each gets its own group.
+	// CA × 1.5 × 3000 = 4500 impact ; divers × 0.8 × 200 = 160 impact.
+	// totalPnL = 3200, so CA risk has highest ImpactPct.
+	txs := []Transaction{
+		{ID: "small", Amount: -200, Status: StatusNonTraite, Category: "divers", EntityID: "ent_small"},
+		{ID: "big", Amount: -3000, Status: StatusNonTraite, Category: "ca", EntityID: "ent_big"},
+	}
+	r, _ := Compute(txs, nil, Config{})
+	if len(r.TopRisks) < 2 {
+		t.Fatalf("expected 2 risks, got %d", len(r.TopRisks))
+	}
+	if r.TopRisks[0].Amount != 3000 {
+		t.Errorf("first risk Amount = %v want 3000", r.TopRisks[0].Amount)
+	}
+	if r.TopRisks[1].Amount != 200 {
+		t.Errorf("second risk Amount = %v want 200", r.TopRisks[1].Amount)
+	}
+}
+
+func TestComputeTopRisksGroupsWhenSameEntity(t *testing.T) {
+	// Same entity ID → grouped into a single risk.
+	txs := []Transaction{
+		{ID: "a", Amount: -200, Status: StatusNonTraite, Category: "divers"},
+		{ID: "b", Amount: -300, Status: StatusNonTraite, Category: "divers"},
+	}
+	r, _ := Compute(txs, nil, Config{})
+	if len(r.TopRisks) != 1 {
+		t.Fatalf("expected 1 grouped risk, got %d", len(r.TopRisks))
+	}
+	if r.TopRisks[0].Amount != 500 {
+		t.Errorf("grouped risk Amount = %v want 500", r.TopRisks[0].Amount)
+	}
+	if len(r.TopRisks[0].TxIDs) != 2 {
+		t.Errorf("expected 2 tx ids in grouped risk, got %d", len(r.TopRisks[0].TxIDs))
+	}
+}
+
+// ptr returns a pointer to the given float64 (test convenience).
+func ptr(v float64) *float64 { return &v }
+
+func TestComputeDeterminism(t *testing.T) {
+	// Same fixture, 100 runs, varying GOMAXPROCS. Result must be identical.
+	txs := []Transaction{
+		{ID: "x", Amount: 1000, Status: StatusTraite, Account: "706", Category: "ca", MatchConfidence: 0.9},
+		{ID: "y", Amount: -200, Status: StatusNonTraite, Category: "salaires"},
+		{ID: "z", Amount: -50, Status: StatusAjustement, EntityID: "ent_e",
+			Account: "486", Adjustment: &Adjustment{Reason: "cca", SignalActuel: ptr(0.7)}},
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+
+	first, _ := Compute(txs, nil, Config{})
+	for procs := 1; procs <= 8; procs++ {
+		runtime.GOMAXPROCS(procs)
+		for i := 0; i < 25; i++ {
+			r, _ := Compute(txs, nil, Config{})
+			// Result is a struct with slices; deep equal by re-marshaling
+			// (the marshaled forms are deterministic too).
+			if r.Global != first.Global || r.Treated != first.Treated ||
+				r.Untreated != first.Untreated || r.Adjusted != first.Adjusted ||
+				r.TotalPnL != first.TotalPnL || r.Materiality != first.Materiality ||
+				len(r.TopRisks) != len(first.TopRisks) {
+				t.Fatalf("Compute drifted at procs=%d iter=%d", procs, i)
+			}
+			for k := range r.TopRisks {
+				if !sameRisk(r.TopRisks[k], first.TopRisks[k]) {
+					t.Fatalf("TopRisk[%d] drifted at procs=%d iter=%d", k, procs, i)
+				}
+			}
+		}
+	}
+}

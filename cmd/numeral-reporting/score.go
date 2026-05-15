@@ -2,13 +2,18 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"text/tabwriter"
+	"time"
 
 	"github.com/numeral/numeral-reporting-cli/internal/entities"
+	"github.com/numeral/numeral-reporting-cli/internal/scoring"
 )
 
 // entities.json sits at the project root, shared across versions.
@@ -200,5 +205,332 @@ func truncate(s string, max int) string {
 	}
 	r := []rune(s)
 	return string(r[:max-1]) + "…"
+}
+
+// ---- score subcommand ----
+
+// transactionsFile mirrors versions/vN/transactions.json on disk.
+type transactionsFile struct {
+	SchemaVersion int                     `json:"schema_version"`
+	Period        string                  `json:"period,omitempty"`
+	TotalPnL      float64                 `json:"total_pnl,omitempty"`
+	Materiality   float64                 `json:"materiality_threshold,omitempty"`
+	GeneratedAt   string                  `json:"generated_at,omitempty"`
+	Transactions  []scoring.Transaction   `json:"transactions"`
+}
+
+func transactionsPath(root string, n int) string {
+	return filepath.Join(staticVersionDir(root, n), "transactions.json")
+}
+
+func loadTransactions(root string, n int) (*transactionsFile, error) {
+	path := transactionsPath(root, n)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%s: no transactions.json — run the agent's categorize step first", path)
+		}
+		return nil, err
+	}
+	var f transactionsFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if f.SchemaVersion == 0 {
+		f.SchemaVersion = scoring.SchemaVersion
+	}
+	return &f, nil
+}
+
+func saveTransactions(root string, n int, f *transactionsFile) error {
+	path := transactionsPath(root, n)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".transactions.*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(f); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// cmdScore implements `numeral-reporting score`.
+func cmdScore(args []string) error {
+	fs := flag.NewFlagSet("score", flag.ExitOnError)
+	project := fs.String("project", ".", "project directory")
+	version := fs.String("version", "", "version (default: active)")
+	asJSON := fs.Bool("json", false, "emit JSON to stdout")
+	write := fs.Bool("write", false, "persist computed scores back into report.json and transactions.json")
+	threshold := fs.Int("score-threshold", 0, "if >0, exit 3 when global score < threshold (in percent)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	root, err := filepath.Abs(*project)
+	if err != nil {
+		return err
+	}
+	n, err := staticVersionFromFlag(root, *version)
+	if err != nil {
+		return err
+	}
+
+	txFile, err := loadTransactions(root, n)
+	if err != nil {
+		return err
+	}
+	store, err := loadEntities(root)
+	if err != nil {
+		return err
+	}
+
+	// Re-run Resolve on every transaction. This is idempotent: same store +
+	// same libelle → same match. Persists EntityID/MatchConfidence/MatchKind
+	// only on --write.
+	for i := range txFile.Transactions {
+		m := entities.Resolve(store, txFile.Transactions[i].LibelleRaw)
+		txFile.Transactions[i].LibelleNorm = m.Norm
+		txFile.Transactions[i].EntityID = m.EntityID
+		txFile.Transactions[i].MatchConfidence = m.Confidence
+		txFile.Transactions[i].MatchKind = string(m.Kind)
+	}
+
+	// History: load all frozen versions strictly older than n, deterministically.
+	history, err := loadHistorySnapshots(root, n)
+	if err != nil {
+		return err
+	}
+
+	result, components := scoring.Compute(txFile.Transactions, history, scoring.Config{})
+
+	if *write {
+		// Persist components into transactions.json.
+		for i := range txFile.Transactions {
+			c, ok := components[txFile.Transactions[i].ID]
+			if !ok {
+				txFile.Transactions[i].Components = nil
+				continue
+			}
+			cp := c
+			txFile.Transactions[i].Components = &cp
+		}
+		txFile.SchemaVersion = scoring.SchemaVersion
+		txFile.TotalPnL = result.TotalPnL
+		txFile.Materiality = result.Materiality
+		txFile.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := saveTransactions(root, n, txFile); err != nil {
+			return err
+		}
+		if err := persistReportScore(root, n, result); err != nil {
+			return err
+		}
+	}
+
+	if *asJSON {
+		out := struct {
+			Version     string                 `json:"version"`
+			Result      scoring.Result         `json:"result"`
+			TopRisks    []scoring.Risk         `json:"top_risks"`
+			ComputedAt  string                 `json:"computed_at,omitempty"`
+		}{
+			Version:    fmt.Sprintf("v%d", n),
+			Result:     result,
+			TopRisks:   result.TopRisks,
+			ComputedAt: txFile.GeneratedAt,
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(out); err != nil {
+			return err
+		}
+	} else {
+		printScoreSummary(n, result)
+	}
+
+	if *threshold > 0 && int(math.Round(result.Global*100)) < *threshold {
+		os.Exit(3)
+	}
+	return nil
+}
+
+func printScoreSummary(n int, r scoring.Result) {
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "score v%d — Total P&L %.0f €  (materiality %.0f €)\n", n, r.TotalPnL, r.Materiality)
+	fmt.Fprintf(w, "  traité\t%.0f €\t%.1f %%\n", r.Treated.Amount, r.Treated.Score*100)
+	fmt.Fprintf(w, "  non traité\t%.0f €\t%.1f %%\n", r.Untreated.Amount, r.Untreated.Score*100)
+	fmt.Fprintf(w, "  ajusté\t%.0f €\t%.1f %%\n", r.Adjusted.Amount, r.Adjusted.Score*100)
+	fmt.Fprintf(w, "  global\t\t%.0f %%  (%s)\n", r.Global*100, r.Level)
+	w.Flush()
+	if len(r.TopRisks) > 0 {
+		fmt.Println("\ntop risks")
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		for i, rk := range r.TopRisks {
+			fmt.Fprintf(w, "  %d.\t%s\t%.0f €\t(%.1f %%)\n", i+1, rk.Label, rk.Amount, rk.ImpactPct)
+		}
+		w.Flush()
+	}
+}
+
+// loadHistorySnapshots reads frozen versions < n and returns snapshots in
+// ascending order. Missing transactions.json in a prior version is OK (pre-
+// engine state) — that version simply contributes nothing.
+func loadHistorySnapshots(root string, current int) ([]scoring.HistoricalSnapshot, error) {
+	meta, err := readStaticMeta(root)
+	if err != nil {
+		return nil, err
+	}
+	type frozenN struct{ N int }
+	var frozen []frozenN
+	for _, v := range meta.Versions {
+		if v.N < current && v.Frozen {
+			frozen = append(frozen, frozenN{N: v.N})
+		}
+	}
+	// Sort ascending by N for deterministic iteration.
+	for i := 1; i < len(frozen); i++ {
+		for j := i; j > 0 && frozen[j-1].N > frozen[j].N; j-- {
+			frozen[j-1], frozen[j] = frozen[j], frozen[j-1]
+		}
+	}
+	snaps := make([]scoring.HistoricalSnapshot, 0, len(frozen))
+	for _, fz := range frozen {
+		tx, err := loadTransactions(root, fz.N)
+		if err != nil {
+			// Missing transactions.json in older version: pre-engine, skip.
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				continue
+			}
+			// loadTransactions wraps with a custom "no transactions.json"
+			// message when fs.ErrNotExist — detect via fs.ErrNotExist too.
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			// Other errors (malformed JSON): surface, don't silently swallow.
+			return nil, err
+		}
+		snap := scoring.HistoricalSnapshot{
+			Version:       fmt.Sprintf("v%d", fz.N),
+			EntityAmounts: map[string][]float64{},
+			EntityMonths:  map[string]map[string]int{},
+		}
+		for _, t := range tx.Transactions {
+			if t.EntityID == "" {
+				continue
+			}
+			snap.EntityAmounts[t.EntityID] = append(snap.EntityAmounts[t.EntityID], t.Amount)
+			if snap.EntityMonths[t.EntityID] == nil {
+				snap.EntityMonths[t.EntityID] = map[string]int{}
+			}
+			if t.PeriodMonth != "" {
+				snap.EntityMonths[t.EntityID][t.PeriodMonth]++
+			}
+		}
+		snaps = append(snaps, snap)
+	}
+	return snaps, nil
+}
+
+// persistReportScore overlays the score block into versions/vN/report.json.
+// It preserves every other field via a json.RawMessage merge.
+func persistReportScore(root string, n int, r scoring.Result) error {
+	path := staticReportPath(root, n)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	score := buildReportScore(r)
+	scoreJSON, err := json.MarshalIndent(score, "", "  ")
+	if err != nil {
+		return err
+	}
+	doc["score"] = scoreJSON
+
+	// Re-emit document with sorted keys for byte-stable output.
+	// json.Marshal of a map is sorted by key in stdlib.
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(path, out, 0o644)
+}
+
+type reportBlock struct {
+	Amount      float64 `json:"amount"`
+	Score       float64 `json:"score"`
+	Percent     int     `json:"percent"`
+	Description string  `json:"description"`
+}
+
+type reportRisk struct {
+	Kind      string   `json:"kind"`
+	Label     string   `json:"label"`
+	EntityID  string   `json:"entity_id,omitempty"`
+	Amount    float64  `json:"amount"`
+	ImpactPct float64  `json:"impact_pct"`
+	TxIDs     []string `json:"tx_ids,omitempty"`
+}
+
+type reportScore struct {
+	Global              int           `json:"global"`
+	Level               string        `json:"level"`
+	Label               string        `json:"label"`
+	Treated             *reportBlock  `json:"treated,omitempty"`
+	Untreated           *reportBlock  `json:"untreated,omitempty"`
+	Adjusted            *reportBlock  `json:"adjusted,omitempty"`
+	TopRisks            []reportRisk  `json:"top_risks,omitempty"`
+	Materiality         float64       `json:"materiality_threshold,omitempty"`
+	ComputedAt          string        `json:"computed_at,omitempty"`
+	ScoreSchemaVersion  int           `json:"score_schema_version,omitempty"`
+}
+
+func buildReportScore(r scoring.Result) reportScore {
+	mkBlock := func(b scoring.Block) *reportBlock {
+		return &reportBlock{
+			Amount:      b.Amount,
+			Score:       b.Score,
+			Percent:     int(math.Round(b.Score * 100)),
+			Description: fmt.Sprintf("%.0f € (%.0f %%)", b.Amount, b.Score*100),
+		}
+	}
+	risks := make([]reportRisk, 0, len(r.TopRisks))
+	for _, rk := range r.TopRisks {
+		risks = append(risks, reportRisk{
+			Kind:      rk.Kind,
+			Label:     rk.Label,
+			EntityID:  rk.EntityID,
+			Amount:    rk.Amount,
+			ImpactPct: rk.ImpactPct,
+			TxIDs:     rk.TxIDs,
+		})
+	}
+	return reportScore{
+		Global:             int(math.Round(r.Global * 100)),
+		Level:              r.Level,
+		Label:              r.Label,
+		Treated:            mkBlock(r.Treated),
+		Untreated:          mkBlock(r.Untreated),
+		Adjusted:           mkBlock(r.Adjusted),
+		TopRisks:           risks,
+		Materiality:        r.Materiality,
+		ComputedAt:         time.Now().UTC().Format(time.RFC3339),
+		ScoreSchemaVersion: scoring.SchemaVersion,
+	}
 }
 

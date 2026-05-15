@@ -49,6 +49,7 @@ Usage:
   numeral-reporting activate <N> [--project DIR]
   numeral-reporting refresh [--project DIR]
   numeral-reporting export <N> <out.pdf> [--url URL] [--project DIR]
+  numeral-reporting score [--version vN] [--json] [--write] [--score-threshold INT] [--project DIR]
   numeral-reporting entities list|show|reset [...] [--project DIR]
 
 Run inside a project directory, or pass --project DIR.
@@ -95,6 +96,8 @@ func main() {
 		err = cmdExport(args)
 	case "entities":
 		err = cmdEntities(args)
+	case "score":
+		err = cmdScore(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
